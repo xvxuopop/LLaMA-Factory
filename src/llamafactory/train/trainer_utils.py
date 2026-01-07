@@ -22,6 +22,7 @@ import os
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional, Union
+import socket
 
 import torch
 from transformers import Trainer
@@ -30,6 +31,7 @@ from transformers.modeling_utils import is_fsdp_enabled
 from transformers.optimization import get_scheduler
 from transformers.pytorch_utils import ALL_LAYERNORM_LAYERS
 from transformers.trainer_pt_utils import get_parameter_names
+from transformers.utils import is_torch_cuda_available, is_torch_npu_available
 from typing_extensions import override
 
 from ..extras import logging
@@ -840,3 +842,69 @@ def get_ray_trainer(
         ),
     )
     return trainer
+
+
+def find_free_port(start, end, host):
+    if not (0 <= start <= end <= 65535):
+        raise ValueError("port range must be 0-65535")
+    
+    for port in range(start, end):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                sock.bind((host, port))
+                return port
+            except OSError:
+                continue
+    raise RuntimeError(f"No free port in range [{start}, {end}]")
+
+
+def get_ray_remote_config_for_worker(
+    placement_group,
+    bundle_idx,
+    rank,
+    world_size,
+    master_addr,
+    master_port,
+):
+    from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
+    
+    env_vars = {
+        "RANK": str(rank),
+        "WORLD_SIZE": str(world_size),
+        "MASTER_ADDR": master_addr,
+        "MASTER_PORT": master_port,
+    }
+    
+    remote_config = {
+        "scheduling_strategy": PlacementGroupSchedulingStrategy(
+            placement_group=placement_group,
+            placement_group_bundle_index=bundle_idx,
+        ),
+        "runtime_env": {
+            "env_vars": env_vars
+        },
+        "num_cpus": 1,
+    }
+    
+    if is_torch_cuda_available():
+        remote_config["num_gpus"] = 1
+    elif is_torch_npu_available():
+        remote_config["resources"] = {"NPU": 1}
+    
+    return remote_config
+
+
+def create_placement_group(num_workers):
+    from ray.util.placement_group import placement_group
+    
+    bundle = {"CPU": 1}
+    if is_torch_cuda_available():
+        bundle["GPU"] = 1
+    elif is_torch_npu_available():
+        bundle["NPU"] = 1
+    
+    bundles = [bundle for _ in range(num_workers)]
+    pg = placement_group(bundles, strategy="PACK")
+
+    return pg, bundle

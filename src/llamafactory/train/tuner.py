@@ -1,10 +1,11 @@
+
 # Copyright 2025 the KVCache.AI team, Approaching AI, and the LlamaFactory team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
-#     http://www.apache.org/licenses/LICENSE-2.0
+#     http://www.apache.org/licenses/LICENSE-2.0 
 #
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
@@ -14,11 +15,13 @@
 
 import os
 import shutil
+from datetime import timedelta
 from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 import torch.distributed as dist
 from transformers import EarlyStoppingCallback, PreTrainedModel
+from transformers.utils import is_torch_cuda_available, is_torch_npu_available
 
 from ..data import get_template_and_fix_tokenizer
 from ..extras import logging
@@ -34,7 +37,7 @@ from .ppo import run_ppo
 from .pt import run_pt
 from .rm import run_rm
 from .sft import run_sft
-from .trainer_utils import get_ray_trainer, get_swanlab_callback
+from .trainer_utils import get_ray_trainer, get_swanlab_callback, find_free_port, get_ray_remote_config_for_worker, create_placement_group
 
 
 if is_ray_available():
@@ -115,13 +118,7 @@ def run_exp(args: Optional[dict[str, Any]] = None, callbacks: Optional[list["Tra
     ray_args = get_ray_args(args)
     callbacks = callbacks or []
     if ray_args.use_ray:
-        callbacks.append(RayTrainReportCallback())
-        trainer = get_ray_trainer(
-            training_function=_training_function,
-            train_loop_config={"args": args, "callbacks": callbacks},
-            ray_args=ray_args,
-        )
-        trainer.fit()
+        _ray_training_function(ray_args, args, callbacks)
     else:
         _training_function(config={"args": args, "callbacks": callbacks})
 
@@ -212,3 +209,105 @@ def export_model(args: Optional[dict[str, Any]] = None) -> None:
     with open(ollama_modelfile, "w", encoding="utf-8") as f:
         f.write(template.get_ollama_modelfile(tokenizer))
         logger.info_rank0(f"Ollama modelfile saved in {ollama_modelfile}")
+
+
+class WorkerBase:
+    def init_env(self):
+        self._setup_env_visible_devices()
+
+        world_size = os.environ["WORLD_SIZE"]
+        rank = os.environ["RANK"]
+        master_addr = os.environ["MASTER_ADDR"]
+        master_port = os.environ["MASTER_PORT"]
+        local_rank = "0"
+
+        store = {
+            "WORLD_SIZE": world_size,
+            "RANK": rank,
+            "LOCAL_RANK": local_rank,
+            "MASTER_ADDR": master_addr,
+            "MASTER_PORT": master_port,
+        }
+        
+        visible_devcies_keyword = "ASCEND_RT_VISIBLE_DEVICES" if is_torch_npu_available() else "CUDA_VISIBLE_DEVICES"
+        visible_devices_id = os.environ.get(visible_devcies_keyword)
+        store[visible_devcies_keyword] = visible_devices_id
+        for key, value in store.items():
+            if value is not None:
+                os.environ[key] = value
+        os.environ["REDIS_STORE_SERVER_HOST"] = master_addr
+
+        if not dist.is_initialized():
+            dist.init_process_group(
+                backend="hccl",
+                timeout=timedelta(minutes=5),
+                world_size=int(os.getenv("WORLD_SIZE")),
+                rank=int(os.getenv("RANK")),
+            )
+        print("--initialize process group")
+
+        if is_torch_cuda_available():
+            torch.cuda.set_device(0)
+        elif is_torch_npu_available():
+            torch.npu.set_device(0)
+
+    def _setup_env_visible_devices(self):
+        RAY_NOSET_VISIBLE_DEVICES_LIST = [
+            "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES",
+            "RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES",
+        ]
+        is_ray_noset_visible_devices = any(os.environ.get(env_var, None) for env_var in RAY_NOSET_VISIBLE_DEVICES_LIST)
+        if is_ray_noset_visible_devices:
+            device_name = "NPU" if is_torch_npu_available() else "GPU"
+            local_rank = ray.get_runtime_context().get_accelerator_ids()[device_name][0]
+            os.environ["LOCAL_RANK"] = local_rank
+            if is_torch_cuda_available():
+                torch.cuda.set_device(int(local_rank))
+            elif is_torch_npu_available():
+                torch.npu.set_device(int(local_rank))
+            
+    def _training_function(self, config: dict[str, Any]) -> None:
+        _training_function(config)
+        dist.destroy_process_group()
+        
+
+def _ray_training_function(ray_args, args, callbacks):
+    num_workers = 32  # ray_args.ray_num_workers
+    logger.info(f"Using ray.remote mode with {num_workers} workers for distributed training.")
+
+    # initialize ray
+    if not ray.is_initialized():
+        if ray_args.ray_init_kwargs is not None:
+            ray.init(**ray_args.ray_init_kwargs)
+        else:
+            ray.init()
+    
+    # create placementgroup for resource management
+    pg, bundle = create_placement_group(num_workers)
+    ray.get(pg.ready())
+    logger.info(f"Create placement group with {num_workers} bundles: {bundle}")
+    
+    # WorkerBase class -> Ray Actor
+    worker_cls = WorkerBase
+    Worker = ray.remote(worker_cls)
+    free_port = str(find_free_port(29500, 29600, "90.90.97.70"))
+    
+    # luanch workers
+    workers = []
+    for rank in range(num_workers):
+        remote_config = get_ray_remote_config_for_worker(
+            placement_group=pg,
+            bundle_idx=rank,
+            rank=rank,
+            world_size=num_workers,
+            master_addr="90.90.97.70",
+            master_port=free_port,
+        )
+        
+        worker = Worker.options(**remote_config).remote()
+        workers.append(worker)
+    
+    ray.get([workers[i].init_env.remote() for i in range(32)])
+    ray.get([worker._training_function.remote(config={"args": args, "callbacks": callbacks}) for worker in workers])
+    # ray.get([workers[0]._training_function.remote(config={"args": args, "callbacks": callbacks})])
+    ray.shutdown()
