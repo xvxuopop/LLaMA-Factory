@@ -19,6 +19,7 @@
 
 import json
 import os
+import socket
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional, Union
@@ -30,6 +31,7 @@ from transformers.modeling_utils import is_fsdp_enabled
 from transformers.optimization import get_scheduler
 from transformers.pytorch_utils import ALL_LAYERNORM_LAYERS
 from transformers.trainer_pt_utils import get_parameter_names
+from transformers.utils import is_torch_cuda_available, is_torch_npu_available
 from typing_extensions import override
 
 from ..extras import logging
@@ -49,8 +51,8 @@ if is_apollo_available():
 
 if is_ray_available():
     import ray
-    from ray.train import RunConfig, ScalingConfig
-    from ray.train.torch import TorchTrainer
+    from ray.util.placement_group import placement_group
+    from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 
 if TYPE_CHECKING:
@@ -840,3 +842,59 @@ def get_ray_trainer(
         ),
     )
     return trainer
+
+
+def get_placement_group(num_workers, strategy):
+    bundle = {"CPU": 1}
+    if is_torch_cuda_available():
+        bundle["GPU"] = 1
+    elif is_torch_npu_available():
+        bundle["NPU"] = 1
+
+    bundles = [bundle for _ in range(num_workers)]
+    pg = placement_group(bundles, strategy=strategy)
+
+    return pg, bundle
+
+
+def get_ray_remote_config_for_worker(
+    placement_group,
+    bundle_idx,
+    rank,
+    world_size,
+    master_addr,
+    master_port,
+):
+    # "RANK": str(rank),
+    env_vars = {
+        "RANK": str(rank),
+        "WORLD_SIZE": str(world_size),
+        "MASTER_ADDR": master_addr,
+        "MASTER_PORT": master_port,
+        "TORCHELASTIC_USE_AGENT_STORE": "False",
+    }
+
+    remote_config = {
+        "scheduling_strategy": PlacementGroupSchedulingStrategy(
+            placement_group=placement_group,
+            placement_group_bundle_index=bundle_idx,
+        ),
+        "runtime_env": {"env_vars": env_vars},
+        "num_cpus": 1,
+    }
+
+    if is_torch_cuda_available():
+        remote_config["num_gpus"] = 1
+    elif is_torch_npu_available():
+        remote_config["resources"] = {"NPU": 1}
+
+    return remote_config
+
+
+@ray.remote
+def get_master_addr_port() -> tuple[str, str]:
+    addr = ray.util.get_node_ip_address().strip("[]")
+    with socket.socket() as sock:
+        sock.bind(("", 0))
+        port = sock.getsockname()[1]
+    return addr, str(port)
